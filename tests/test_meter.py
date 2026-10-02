@@ -1093,6 +1093,35 @@ console.log(JSON.stringify({{texts:textOps.map(op=>op[1]),logos:canvas.ctx.ops.f
         self.assertEqual(rendered["commitOp"][1:4], ["—", 1008, 486])
         self.assertIn("Commits pushed unavailable.", rendered["aria"])
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for canvas verification")
+    def test_standalone_canvas_hero_and_commits_never_overlap_without_condensed_font(self):
+        page_path = Path(meter.__file__).with_name("performance.html")
+        script = f"""
+const fs=require('fs'),page=fs.readFileSync({json.dumps(str(page_path))},'utf8');
+function extract(name){{let start=page.indexOf(`function ${{name}}(`);if(start<0)throw Error(`missing ${{name}}`);let i=page.indexOf('{{',start),depth=0;for(;i<page.length;i++){{if(page[i]==='{{')depth++;else if(page[i]==='}}'&&--depth===0)return page.slice(start,i+1);}}throw Error(`unclosed ${{name}}`);}}
+for(const name of ['safeArray','sanitizeBuilderName','compactNumber','durationLabel','formatStat','formatSpend','ellipsize','fitText','gradientFill','radialFill','fillRoundedRect','setTracking','ditherRegion','supportingStats','drawUsageGroup','drawBuilderRecap'])eval(extract(name));
+class Gradient{{addColorStop(){{}}}}
+// Windows hosts usually lack Arial Narrow, so the condensed stack falls back
+// to a wide bold face; the system UI face measures narrower than that fallback.
+function widthFor(font,text){{const size=Number((/([0-9.]+)px/.exec(font)||[])[1])||14;return String(text).length*size*(/Arial Narrow/.test(font)?.62:.5);}}
+class Context{{constructor(){{this.ops=[];this.font='';this.textAlign='left';}}fillRect(){{}}fillText(t,x,y){{this.ops.push({{text:String(t),x,y,font:this.font,align:this.textAlign,width:widthFor(this.font,t)}});}}drawImage(){{}}createLinearGradient(){{return new Gradient();}}createRadialGradient(){{return new Gradient();}}measureText(v){{return {{width:widthFor(this.font,v)}};}}beginPath(){{}}arc(){{}}stroke(){{}}save(){{}}restore(){{}}translate(){{}}rotate(){{}}}}
+class Canvas{{constructor(){{this.ctx=new Context();this.attrs={{}};}}getContext(){{return this.ctx;}}setAttribute(k,v){{this.attrs[k]=String(v);}}}}
+const results=[];
+for(const [lines,commits] of [[325208,1105],[98765432,123456],[42,7]]){{
+ const payload={{range_days:30,current:{{end_day:'2026-10-02'}},spotlights:[{{id:'lines_pushed',available:true,current:lines,unit:'lines'}},{{id:'commits_pushed',available:true,current:commits,unit:'commits'}}],supporting:[],activity_days:[],usage:{{agents:[],models:[]}}}};
+ const canvas=new Canvas();drawBuilderRecap(canvas,payload,{{name:'',includeUsage:false}});
+ const hero=canvas.ctx.ops.find(op=>op.x===58&&op.y===486),commit=canvas.ctx.ops.find(op=>op.x===1008&&op.y===486);
+ results.push({{heroRight:hero.x+hero.width,commitLeft:commit.x-commit.width,hero:hero.text,commit:commit.text}});
+}}
+console.log(JSON.stringify(results));
+"""
+        result = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for row in json.loads(result.stdout):
+            self.assertLess(row["heroRight"], row["commitLeft"], row)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for texture verification")
     def test_standalone_texture_helpers_dither_gradients_and_degrade_safely(self):
         page_path = Path(meter.__file__).with_name("performance.html")
@@ -10681,6 +10710,47 @@ console.log(JSON.stringify({
         self.assertIn("capabilityEvidenceState!=='current'", self.page)
         self.assertIn("Confirmation closed", self.page)
         self.assertIn("if(capabilitySort==='returned')capabilitySort='use'", self.page)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
+    def test_capability_inventory_refresh_keeps_rows_while_loading(self):
+        page_path = Path(meter.__file__).with_name("page.html")
+        script = f"""
+const fs=require('fs');
+const page=fs.readFileSync({json.dumps(str(page_path))},'utf8');
+const tbody={{innerHTML:'<tr>row 1</tr><tr>row 2</tr>'}},count={{textContent:'2 shown'}};
+const table={{querySelector:sel=>sel==='tbody'?tbody:null}};
+const $=id=>id==='c-table'?table:id==='c-filter-count'?count:null;
+let LATEST={{xsession:{{capabilities:{{inventory_revision:'rev-2'}}}}}};
+let capabilityInventoryLoading=false,capabilityInventorySnapshot={{inventory_revision:'rev-1',items:[]}};
+function currentCapabilitySummary(){{return LATEST.xsession.capabilities;}}
+function currentCapabilityInventory(){{const cap=currentCapabilitySummary();return capabilityInventorySnapshot.inventory_revision===cap.inventory_revision?{{...cap,items:capabilityInventorySnapshot.items}}:null;}}
+const rendered=[];function renderCapabilityTable(cap,opts){{rendered.push(cap.inventory_revision);}}
+let resolveFetch,failFetch;
+globalThis.fetch=()=>new Promise((resolve,reject)=>{{resolveFetch=resolve;failFetch=reject;}});
+eval(page.slice(page.indexOf('async function loadCapabilityInventory('),page.indexOf('let pendingCapabilityAction=null;')));
+(async()=>{{
+ const pending=loadCapabilityInventory();
+ const duringLoad=tbody.innerHTML;
+ resolveFetch({{ok:true,json:async()=>({{ok:true,inventory_revision:'rev-2',items:[]}})}});
+ await pending;
+ LATEST.xsession.capabilities={{inventory_revision:'rev-3'}};
+ const failing=loadCapabilityInventory();
+ failFetch(new Error('offline'));
+ await failing;
+ console.log(JSON.stringify({{duringLoad,afterFailure:tbody.innerHTML,count:count.textContent,rendered}}));
+}})();
+"""
+        result = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        # A background refresh must not collapse the table the reader is scrolling.
+        self.assertEqual(state["duringLoad"], "<tr>row 1</tr><tr>row 2</tr>")
+        self.assertEqual(state["rendered"], ["rev-2"])
+        # A failed background refresh keeps the last good rows instead of an error row.
+        self.assertEqual(state["afterFailure"], "<tr>row 1</tr><tr>row 2</tr>")
+        self.assertEqual(state["count"], "2 shown")
 
     def test_agent_access_has_a_dedicated_settings_tab(self):
         for marker in ("id=agent-discovery", "id=agent-access", "id=agent-clients",
