@@ -10711,6 +10711,47 @@ console.log(JSON.stringify({
         self.assertIn("Confirmation closed", self.page)
         self.assertIn("if(capabilitySort==='returned')capabilitySort='use'", self.page)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript")
+    def test_capability_inventory_refresh_keeps_rows_while_loading(self):
+        page_path = Path(meter.__file__).with_name("page.html")
+        script = f"""
+const fs=require('fs');
+const page=fs.readFileSync({json.dumps(str(page_path))},'utf8');
+const tbody={{innerHTML:'<tr>row 1</tr><tr>row 2</tr>'}},count={{textContent:'2 shown'}};
+const table={{querySelector:sel=>sel==='tbody'?tbody:null}};
+const $=id=>id==='c-table'?table:id==='c-filter-count'?count:null;
+let LATEST={{xsession:{{capabilities:{{inventory_revision:'rev-2'}}}}}};
+let capabilityInventoryLoading=false,capabilityInventorySnapshot={{inventory_revision:'rev-1',items:[]}};
+function currentCapabilitySummary(){{return LATEST.xsession.capabilities;}}
+function currentCapabilityInventory(){{const cap=currentCapabilitySummary();return capabilityInventorySnapshot.inventory_revision===cap.inventory_revision?{{...cap,items:capabilityInventorySnapshot.items}}:null;}}
+const rendered=[];function renderCapabilityTable(cap,opts){{rendered.push(cap.inventory_revision);}}
+let resolveFetch,failFetch;
+globalThis.fetch=()=>new Promise((resolve,reject)=>{{resolveFetch=resolve;failFetch=reject;}});
+eval(page.slice(page.indexOf('async function loadCapabilityInventory('),page.indexOf('let pendingCapabilityAction=null;')));
+(async()=>{{
+ const pending=loadCapabilityInventory();
+ const duringLoad=tbody.innerHTML;
+ resolveFetch({{ok:true,json:async()=>({{ok:true,inventory_revision:'rev-2',items:[]}})}});
+ await pending;
+ LATEST.xsession.capabilities={{inventory_revision:'rev-3'}};
+ const failing=loadCapabilityInventory();
+ failFetch(new Error('offline'));
+ await failing;
+ console.log(JSON.stringify({{duringLoad,afterFailure:tbody.innerHTML,count:count.textContent,rendered}}));
+}})();
+"""
+        result = subprocess.run(
+            ["node", "-e", script], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        # A background refresh must not collapse the table the reader is scrolling.
+        self.assertEqual(state["duringLoad"], "<tr>row 1</tr><tr>row 2</tr>")
+        self.assertEqual(state["rendered"], ["rev-2"])
+        # A failed background refresh keeps the last good rows instead of an error row.
+        self.assertEqual(state["afterFailure"], "<tr>row 1</tr><tr>row 2</tr>")
+        self.assertEqual(state["count"], "2 shown")
+
     def test_agent_access_has_a_dedicated_settings_tab(self):
         for marker in ("id=agent-discovery", "id=agent-access", "id=agent-clients",
                        "id=agent-dialog", "/agent-access/status", "/agent-access/toggle",

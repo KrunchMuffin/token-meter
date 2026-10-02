@@ -4490,8 +4490,14 @@ async function loadCapabilityInventory({force=false}={}){
   return;
  }
  capabilityInventoryLoading=true;
- $('c-filter-count').textContent='Loading inventory…';
- $('c-table').querySelector('tbody').innerHTML='<tr><td colspan=7 class=capEmpty>Loading local capability inventory…</td></tr>';
+ // Usage counts change the revision on every agent tool call. Keep the rows
+ // already shown while a background refresh loads so the table never collapses
+ // under the reader and resets their scroll position.
+ const firstLoad=!capabilityInventorySnapshot;
+ if(firstLoad){
+  $('c-filter-count').textContent='Loading inventory…';
+  $('c-table').querySelector('tbody').innerHTML='<tr><td colspan=7 class=capEmpty>Loading local capability inventory…</td></tr>';
+ }
  try{
   const response=await fetch('/capabilities/inventory',{cache:'no-store'});
   const result=await response.json();
@@ -4500,6 +4506,7 @@ async function loadCapabilityInventory({force=false}={}){
   const merged=currentCapabilityInventory();
   if(merged)renderCapabilityTable(merged,{force});
  }catch(error){
+  if(!firstLoad)return;
   $('c-filter-count').textContent='Inventory unavailable';
   $('c-table').querySelector('tbody').innerHTML='<tr><td colspan=7 class=capEmpty>Inventory could not be loaded.<button class=tbtn type=button data-cap-retry>Retry</button></td></tr>';
   $('c-table').querySelector('[data-cap-retry]')?.addEventListener('click',()=>loadCapabilityInventory({force:true}));
